@@ -93,11 +93,11 @@ def round_half_up(value, places: int = 2) -> float:
     q = Decimal(10) ** -places
     return float(Decimal(str(value)).quantize(q, rounding=ROUND_HALF_UP))
 
-half_up = round_half_up
 
 def calc_work_hours(punch_in: datetime, punch_out: datetime) -> float:
-    """R4: seconds / 3600, half-up to 2 decimals."""
-    return round_half_up((punch_out - punch_in).total_seconds() / 3600, 2)
+    """R4: Decimal(seconds) / Decimal(3600), half-up to 2 decimals."""
+    secs = int((punch_out - punch_in).total_seconds())
+    return round_half_up(Decimal(secs) / Decimal(3600), 2)
 
 def is_half_day(work_hours: float) -> bool:
     """R5: true when rounded work_hours < 4.50."""
