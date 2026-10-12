@@ -5,10 +5,11 @@ Run:  uvicorn app.main:app --port 8000
 Env:  MONGO_URI, MONGO_DB (a local .env is loaded for convenience)
 """
 import os
+import calendar
 from contextlib import asynccontextmanager
 from datetime import datetime, date as date_type, timedelta, timezone
 from decimal import Decimal, ROUND_HALF_UP
-from typing import Optional, Annotated
+from typing import Optional, Annotated, Literal
 
 from bson import json_util
 from dotenv import load_dotenv
@@ -76,6 +77,54 @@ def build_shift_times(date_str: str, shift_start: str, shift_end: str):
     end_d = d + timedelta(days=1) if shift_end <= shift_start else d
     end = datetime(end_d.year, end_d.month, end_d.day, eh, em, tzinfo=IST)
     return start, end
+
+def parse_date(s: str) -> date_type:
+    """Validate and return date object, or raise 422."""
+    try:
+        return date_type.fromisoformat(s)
+    except (ValueError, TypeError):
+        raise HTTPException(422, f"Invalid date format: {s}")
+
+def month_bounds(month_str: str):
+    """Return (first_day_str, last_day_str, first_date, last_date) for YYYY-MM."""
+    try:
+        y, m = map(int, month_str.split("-"))
+        last_day = calendar.monthrange(y, m)[1]
+        d1 = date_type(y, m, 1)
+        d2 = date_type(y, m, last_day)
+        return d1.isoformat(), d2.isoformat(), d1, d2
+    except Exception:
+        raise HTTPException(422, f"Invalid month format: {month_str}")
+
+def build_attendance_list(
+    emp_code: Optional[str] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    status: Optional[str] = None,
+    page: int = 1,
+    page_size: int = 20,
+):
+    filt: dict = {}
+    if emp_code:
+        filt["emp_code"] = emp_code
+    if status:
+        if status not in ALL_STATUSES:
+            raise HTTPException(422, f"Invalid status: {status}")
+        filt["status"] = status
+    if date_from or date_to:
+        d_range: dict = {}
+        if date_from:
+            parse_date(date_from)
+            d_range["$gte"] = date_from
+        if date_to:
+            parse_date(date_to)
+            d_range["$lte"] = date_to
+        if date_from and date_to and date_from > date_to:
+            raise HTTPException(422, "date_from must be <= date_to")
+        filt["date"] = d_range
+    sort = [("date", DESCENDING), ("emp_code", ASCENDING)]
+    skip = (page - 1) * page_size
+    return filt, sort, skip, page_size
 
 # ---- business rule helpers ------------------------------------------------ #
 def calc_late(punch_in: datetime, shift_start_dt: datetime) -> int:
@@ -347,42 +396,23 @@ def list_attendance(
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=100),
 ):
-    filt: dict = {}
-    if emp_code:
-        filt["emp_code"] = emp_code
-    if status:
-        if status not in ALL_STATUSES:
-            raise HTTPException(422, f"Invalid status: {status}")
-        filt["status"] = status
-    if date_from or date_to:
-        d_range: dict = {}
-        if date_from:
-            try:
-                date_type.fromisoformat(date_from)
-            except ValueError:
-                raise HTTPException(422, "Invalid date_from")
-            d_range["$gte"] = date_from
-        if date_to:
-            try:
-                date_type.fromisoformat(date_to)
-            except ValueError:
-                raise HTTPException(422, "Invalid date_to")
-            d_range["$lte"] = date_to
-        if date_from and date_to and date_from > date_to:
-            raise HTTPException(422, "date_from must be <= date_to")
-        filt["date"] = d_range
-
+    filt, sort, skip, limit = build_attendance_list(
+        emp_code=emp_code,
+        date_from=date_from,
+        date_to=date_to,
+        status=status,
+        page=page,
+        page_size=page_size,
+    )
     total = db.attendance_logs.count_documents(filt)
-    skip = (page - 1) * page_size
-    docs = (db.attendance_logs.find(filt)
-            .sort([("date", DESCENDING), ("emp_code", ASCENDING)])
-            .skip(skip).limit(page_size))
+    docs = db.attendance_logs.find(filt).sort(sort).skip(skip).limit(limit)
     return {"items": [serialize_att(d) for d in docs],
             "total": total, "page": page, "page_size": page_size}
 
 # -- regularize (PATCH) --
 @app.patch("/attendance/{emp_code}/{date}")
 def regularize_attendance(emp_code: str, date: str, body: RegularizeIn):
+    parse_date(date)
     emp = db.employees.find_one({"emp_code": emp_code})
     if not emp:
         raise HTTPException(404, f"Employee {emp_code} not found")
@@ -391,113 +421,82 @@ def regularize_attendance(emp_code: str, date: str, body: RegularizeIn):
     if not rec:
         raise HTTPException(404, f"No record for {emp_code} on {date}")
 
-    # Determine new values
-    new_status = body.status if body.status is not None else rec["status"]
-    new_pi = ms_to_dt(body.punch_in) if body.punch_in is not None else rec.get("punch_in")
-    new_po = ms_to_dt(body.punch_out) if body.punch_out is not None else rec.get("punch_out")
+    sent = body.model_fields_set
+    new_status = body.status if "status" in sent else rec["status"]
 
-    # Validate ABSENT/LEAVE: cannot have punch times
     if new_status in ("ABSENT", "LEAVE"):
-        if body.punch_in is not None or body.punch_out is not None:
-            raise HTTPException(422, f"Cannot set punch times with status {new_status}")
-        new_pi = None
-        new_po = None
+        if "punch_in" in sent or "punch_out" in sent:
+            raise HTTPException(422, f"Cannot set punch times for {new_status}")
+        new_in = None
+        new_out = None
+    else:
+        new_in = ms_to_dt(body.punch_in) if "punch_in" in sent and body.punch_in is not None else rec.get("punch_in")
+        new_out = ms_to_dt(body.punch_out) if "punch_out" in sent and body.punch_out is not None else rec.get("punch_out")
 
-    # Presence status requires punch_in
-    if new_status in PRESENT_STATUSES and new_pi is None:
-        raise HTTPException(422, "Presence status requires a punch_in")
+        if new_in is None:
+            raise HTTPException(422, "Presence status requires punch_in")
 
-    # Validate punch_in stays on the record's attendance date
-    if new_pi is not None:
-        computed_date = attendance_date(new_pi, emp["shift_start"], emp["shift_end"])
-        if computed_date != date:
-            raise HTTPException(422, f"punch_in must be on attendance date {date}")
+        if "punch_in" in sent:
+            if attendance_date(new_in, emp["shift_start"], emp["shift_end"]) != rec["date"]:
+                raise HTTPException(422, f"punch_in must be on attendance date {rec['date']}")
 
-    # Validate punch_out constraints
-    if new_pi is not None and new_po is not None:
-        diff = (new_po - new_pi).total_seconds()
-        if diff <= 0:
-            raise HTTPException(422, "punch_out must be after punch_in")
-        if diff > 86400:
-            raise HTTPException(422, "punch_out must be within 24 hours of punch_in")
+        if new_out is not None:
+            diff = (new_out - new_in).total_seconds()
+            if diff <= 0 or diff > 86400:
+                raise HTTPException(422, "punch_out must be after punch_in and within 24 hours")
 
-    # Recompute derived fields
+    shift_s, shift_e = build_shift_times(rec["date"], emp["shift_start"], emp["shift_end"])
     if new_status in ("ABSENT", "LEAVE"):
-        new_late = 0
-        new_wh = None
-        new_ot = 0
-        new_hd = False
-    elif new_pi is not None:
-        shift_s, shift_e = build_shift_times(date, emp["shift_start"], emp["shift_end"])
-        new_late = calc_late(new_pi, shift_s)
-        if new_po is not None:
-            new_wh = calc_work_hours(new_pi, new_po)
-            new_ot = calc_overtime(new_po, shift_e)
+        new_wh, new_late, new_ot, new_hd = None, 0, 0, False
+    else:
+        new_late = calc_late(new_in, shift_s)
+        if new_out is not None:
+            new_wh = calc_work_hours(new_in, new_out)
+            new_ot = calc_overtime(new_out, shift_e)
             new_hd = is_half_day(new_wh)
         else:
-            new_wh = None
-            new_ot = 0
-            new_hd = False
-    else:
-        new_late = 0
-        new_wh = None
-        new_ot = 0
-        new_hd = False
+            new_wh, new_ot, new_hd = None, 0, False
 
-    # Build changes dict: only fields that actually changed
+    old_vals = {
+        "status": rec.get("status"),
+        "punch_in": rec.get("punch_in"),
+        "punch_out": rec.get("punch_out"),
+        "work_hours": rec.get("work_hours"),
+        "late_minutes": rec.get("late_minutes", 0),
+        "overtime_minutes": rec.get("overtime_minutes", 0),
+        "half_day": rec.get("half_day", False),
+    }
+    new_vals = {
+        "status": new_status,
+        "punch_in": new_in,
+        "punch_out": new_out,
+        "work_hours": new_wh,
+        "late_minutes": new_late,
+        "overtime_minutes": new_ot,
+        "half_day": new_hd,
+    }
+
     changes = {}
-    field_pairs = [
-        ("status", rec["status"], new_status),
-        ("punch_in", rec.get("punch_in"), new_pi),
-        ("punch_out", rec.get("punch_out"), new_po),
-        ("work_hours", rec.get("work_hours"), new_wh),
-        ("late_minutes", rec.get("late_minutes", 0), new_late),
-        ("overtime_minutes", rec.get("overtime_minutes", 0), new_ot),
-        ("half_day", rec.get("half_day", False), new_hd),
-    ]
-    for fld, old_val, new_val in field_pairs:
-        if old_val != new_val:
-            changes[fld] = {"from": old_val, "to": new_val}
+    for fld in ("status", "punch_in", "punch_out", "work_hours", "late_minutes", "overtime_minutes", "half_day"):
+        if old_vals[fld] != new_vals[fld]:
+            changes[fld] = {"from": old_vals[fld], "to": new_vals[fld]}
 
     if not changes:
         raise HTTPException(422, "No fields changed")
 
-    history_entry = {
+    entry = {
         "at": now_dt(),
         "by": body.regularized_by,
         "reason": body.reason,
         "changes": changes,
     }
 
-    update_doc = {
-        "$set": {
-            "status": new_status,
-            "punch_in": new_pi,
-            "punch_out": new_po,
-            "work_hours": new_wh,
-            "late_minutes": new_late,
-            "overtime_minutes": new_ot,
-            "half_day": new_hd,
-        },
-        "$push": {"history": history_entry},
-    }
-
-    # Guard with history length for concurrency
-    hist_len = len(rec.get("history", []))
-    if hist_len == 0:
-        # Legacy docs may not have history at all
-        hist_filter = {"$or": [
-            {"history": {"$size": 0}},
-            {"history": {"$exists": False}},
-        ]}
-    else:
-        hist_filter = {"history": {"$size": hist_len}}
-
-    result = db.attendance_logs.update_one(
-        {"_id": rec["_id"], **hist_filter},
-        update_doc,
+    guard = {"history": {"$size": len(rec["history"])}} if "history" in rec else {"history": {"$exists": False}}
+    res = db.attendance_logs.update_one(
+        {"_id": rec["_id"], **guard},
+        {"$set": new_vals, "$push": {"history": entry}},
     )
-    if result.modified_count == 0:
+    if res.matched_count == 0:
         raise HTTPException(409, "Concurrent edit detected, please retry")
 
     updated = db.attendance_logs.find_one({"_id": rec["_id"]})
