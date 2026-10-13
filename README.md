@@ -44,7 +44,7 @@ Indexes are created automatically at application startup during the lifespan con
    For `GET /analytics/departments/{department}/trend`, bad date ranges (invalid date, `to < from`, or `range > 92 days`) return `422` before querying the database, which returns `404` if the department does not exist.
 
 3. **7-Day Trend Moving Average:**
-   The moving average window uses the current calendar day plus up to 6 preceding calendar days in the window. Days where the daily rate is `null` (e.g. non-working weekends or zero headcount) stay within the 7-day window, but are excluded from the average calculation. Moving averages use the exact daily rate values.
+   The moving average window uses the current calendar day plus up to 6 preceding calendar days in the window. Days where the daily rate is `null` (e.g. non-working weekends or zero headcount) stay within the 7-day window, but are excluded from the average calculation. The moving average uses the rounded (4-decimal, half-up) daily rates that appear in the response, then rounds the mean half-up to 4 decimals.
 
 4. **Seed Document in Trend Pipeline:**
    The trend aggregation pipeline uses MongoDB's `$densify` operator to guarantee a continuous date sequence across all days in `from..to`. In MongoDB, `$densify` requires at least one document in its input stream; if a department has zero attendance logs in the entire query window, `$densify` would otherwise produce zero output documents. To ensure exact completeness, a single seed document dated `from_dt - 1 day` is prepended via `$unionWith` (using an index-covered `$match` on employee), densification runs across the full range, and the seed row is filtered out with `$match: {day: {$gte: from_dt}}`.
