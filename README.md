@@ -2,6 +2,20 @@
 
 This is a small employee attendance and analytics service built with FastAPI and MongoDB.
 
+## Tech Stack
+
+- **Framework:** FastAPI (Python 3.11+)
+- **Server:** Uvicorn (ASGI)
+- **Database:** MongoDB 7.0 (via PyMongo with timezone-aware UTC datetimes)
+- **Validation:** Pydantic v2 (strict type constraints for epoch milliseconds and IST strings)
+- **Environment:** python-dotenv
+
+## Architecture
+
+The high-level design diagram is in the `img/` directory:
+
+![Architecture Diagram](img/Gemini_Generated_Image_231dnj231dnj231d.png)
+
 ## Requirements
 
 - Python 3.11+
