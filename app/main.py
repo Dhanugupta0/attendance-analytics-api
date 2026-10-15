@@ -5,6 +5,7 @@ Run:  uvicorn app.main:app --port 8000
 Env:  MONGO_URI, MONGO_DB (a local .env is loaded for convenience)
 """
 import os
+import re
 import json
 import calendar
 from contextlib import asynccontextmanager
@@ -30,6 +31,7 @@ client = MongoClient(
 db = client[os.getenv("MONGO_DB", "attendance_db")]
 
 # ---- constants ------------------------------------------------------------ #
+DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 IST = timezone(timedelta(hours=5, minutes=30))
 PRESENT_STATUSES = {"PRESENT", "WFH", "ON_DUTY"}
 ALL_STATUSES = PRESENT_STATUSES | {"ABSENT", "LEAVE"}
@@ -81,6 +83,8 @@ def build_shift_times(date_str: str, shift_start: str, shift_end: str):
 
 def parse_date(s: str) -> date_type:
     """Validate and return date object, or raise 422."""
+    if not isinstance(s, str) or not DATE_RE.match(s):
+        raise HTTPException(422, f"Invalid date format: {s}")
     try:
         return date_type.fromisoformat(s)
     except (ValueError, TypeError):
@@ -255,6 +259,22 @@ def build_late_leaderboard(month: str, limit: int = 10, department: Optional[str
     ])
     return "attendance_logs", pipeline
 
+def load_trend_inputs(department: str, from_str: str, to_str: str):
+    d_from = parse_date(from_str)
+    d_to = parse_date(to_str)
+    if d_to < d_from:
+        raise HTTPException(422, "'to' date must be >= 'from' date")
+    if (d_to - d_from).days + 1 > 92:
+        raise HTTPException(422, "Date range cannot exceed 92 days")
+
+    emps = list(db.employees.find({"department": department}, {"_id": 0, "emp_code": 1, "joined_on": 1}))
+    if not emps:
+        raise HTTPException(404, f"Department '{department}' not found")
+
+    emp_codes = [e["emp_code"] for e in emps]
+    joined = [e["joined_on"] for e in emps]
+    return emp_codes, joined
+
 def build_department_trend(emp_codes: list, joined: list, from_str: str, to_str: str):
     d_from = parse_date(from_str)
     d_to = parse_date(to_str)
@@ -363,6 +383,8 @@ class EmployeeIn(BaseModel):
     @field_validator("joined_on")
     @classmethod
     def check_date(cls, v):
+        if not isinstance(v, str) or not DATE_RE.match(v):
+            raise ValueError("must be YYYY-MM-DD")
         try:
             date_type.fromisoformat(v)
         except (ValueError, TypeError):
@@ -512,7 +534,7 @@ def punch_in(body: PunchInIn):
 
     punch_dt = ms_to_dt(body.punched_at) if body.punched_at else now_dt()
     date_str = attendance_date(punch_dt, emp["shift_start"], emp["shift_end"])
-    shift_s, shift_e = build_shift_times(date_str, emp["shift_start"], emp["shift_end"])
+    shift_s, _ = build_shift_times(date_str, emp["shift_start"], emp["shift_end"])
 
     late = calc_late(punch_dt, shift_s)
 
@@ -563,7 +585,7 @@ def punch_out(body: PunchOutIn):
     if diff > 86400:
         raise HTTPException(422, "punch_out must be within 24 hours of punch_in")
 
-    shift_s, shift_e = build_shift_times(rec["date"], emp["shift_start"], emp["shift_end"])
+    _, shift_e = build_shift_times(rec["date"], emp["shift_start"], emp["shift_end"])
     wh = calc_work_hours(pi, punch_dt)
     ot = calc_overtime(punch_dt, shift_e)
     hd = is_half_day(wh)
@@ -578,7 +600,7 @@ def punch_out(body: PunchOutIn):
             "half_day": hd,
         }},
     )
-    if result.modified_count == 0:
+    if result.matched_count == 0:
         raise HTTPException(409, "Already punched out")
 
     updated = db.attendance_logs.find_one({"_id": rec["_id"]})
@@ -620,7 +642,7 @@ def regularize_attendance(emp_code: str, date: str, body: RegularizeIn):
         raise HTTPException(404, f"No record for {emp_code} on {date}")
 
     sent = body.model_fields_set
-    new_status = body.status if "status" in sent else rec["status"]
+    new_status = body.status if body.status is not None else rec["status"]
 
     if new_status in ("ABSENT", "LEAVE"):
         if "punch_in" in sent or "punch_out" in sent:
@@ -792,20 +814,7 @@ def get_department_trend(
     from_date: str = Query(..., alias="from"),
     to_date: str = Query(..., alias="to"),
 ):
-    d_from = parse_date(from_date)
-    d_to = parse_date(to_date)
-    if d_to < d_from:
-        raise HTTPException(422, "'to' date must be >= 'from' date")
-    if (d_to - d_from).days + 1 > 92:
-        raise HTTPException(422, "Date range cannot exceed 92 days")
-
-    emps = list(db.employees.find({"department": department}, {"_id": 0, "emp_code": 1, "joined_on": 1}))
-    if not emps:
-        raise HTTPException(404, f"Department '{department}' not found")
-
-    emp_codes = [e["emp_code"] for e in emps]
-    joined = [e["joined_on"] for e in emps]
-
+    emp_codes, joined = load_trend_inputs(department, from_date, to_date)
     coll, pipeline = build_department_trend(emp_codes, joined, from_date, to_date)
     docs = list(db[coll].aggregate(pipeline))
 
@@ -860,7 +869,7 @@ def explain_endpoint(
             emp_code=emp_code, date_from=date_from, date_to=date_to,
             status=status, page=page, page_size=page_size,
         )
-        cmd = {"find": coll, "filter": filt, "sort": {"date": -1, "emp_code": 1}, "skip": skip, "limit": limit_val}
+        cmd = {"find": coll, "filter": filt, "sort": dict(sort), "skip": skip, "limit": limit_val}
     elif endpoint == "employee_monthly":
         if not emp_code or not month:
             raise HTTPException(422, "emp_code and month are required")
@@ -879,17 +888,7 @@ def explain_endpoint(
     elif endpoint == "department_trend":
         if not department or not from_date or not to_date:
             raise HTTPException(422, "department, from, and to are required")
-        d_from = parse_date(from_date)
-        d_to = parse_date(to_date)
-        if d_to < d_from:
-            raise HTTPException(422, "'to' date must be >= 'from' date")
-        if (d_to - d_from).days + 1 > 92:
-            raise HTTPException(422, "Date range cannot exceed 92 days")
-        emps = list(db.employees.find({"department": department}, {"_id": 0, "emp_code": 1, "joined_on": 1}))
-        if not emps:
-            raise HTTPException(404, f"Department '{department}' not found")
-        emp_codes = [e["emp_code"] for e in emps]
-        joined = [e["joined_on"] for e in emps]
+        emp_codes, joined = load_trend_inputs(department, from_date, to_date)
         coll, pipeline = build_department_trend(emp_codes, joined, from_date, to_date)
         cmd = {"aggregate": coll, "pipeline": pipeline, "cursor": {}}
     else:
