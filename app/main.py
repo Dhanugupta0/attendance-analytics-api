@@ -1,8 +1,25 @@
-"""
-Employee Attendance & Analytics API
+"""Employee Attendance & Analytics API with FastAPI and MongoDB.
 
-Run:  uvicorn app.main:app --port 8000
-Env:  MONGO_URI, MONGO_DB (a local .env is loaded for convenience)
+Run locally:
+    uvicorn app.main:app --port 8000
+
+Environment variables:
+    MONGO_URI: MongoDB connection URI (default: mongodb://localhost:27017)
+    MONGO_DB:  MongoDB database name (default: attendance_db)
+
+File layout:
+    1. Config
+    2. Constants
+    3. Time helpers
+    4. Date and shift helpers
+    5. Business rules
+    6. Models
+    7. Serializers
+    8. Indexes and app lifespan
+    9. Query builders
+    10. CRUD endpoints
+    11. Analytics endpoints
+    12. Explain endpoint
 """
 import os
 import re
@@ -22,7 +39,7 @@ from pymongo.errors import DuplicateKeyError
 
 load_dotenv()
 
-# ---- config and client --------------------------------------------------- #
+# ===== CONFIG =====
 client = MongoClient(
     os.getenv("MONGO_URI", "mongodb://localhost:27017"),
     tz_aware=True,
@@ -30,7 +47,7 @@ client = MongoClient(
 )
 db = client[os.getenv("MONGO_DB", "attendance_db")]
 
-# ---- constants ------------------------------------------------------------ #
+# ===== CONSTANTS =====
 DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 IST = timezone(timedelta(hours=5, minutes=30))
 PRESENT_STATUSES = {"PRESENT", "WFH", "ON_DUTY"}
@@ -41,7 +58,7 @@ EPOCH_MAX = 4_102_444_800_000
 # Strict int that rejects floats, strings and bools
 EpochMs = Annotated[int, Field(strict=True, ge=EPOCH_MIN, le=EPOCH_MAX)]
 
-# ---- time helpers --------------------------------------------------------- #
+# ===== TIME HELPERS =====
 def ms_to_dt(ms: int) -> datetime:
     """Epoch ms -> UTC-aware datetime, truncated to whole seconds (R1)."""
     return datetime.fromtimestamp(ms // 1000, tz=timezone.utc)
@@ -58,7 +75,7 @@ def to_ist(dt: datetime) -> datetime:
     """Convert aware datetime to IST."""
     return dt.astimezone(IST)
 
-# ---- date and shift helpers ----------------------------------------------- #
+# ===== DATE AND SHIFT HELPERS =====
 def attendance_date(punch_in: datetime, shift_start: str, shift_end: str) -> str:
     """IST calendar date of the record (R1).
     Overnight exception: punch-in IST time earlier than shift_end -> previous day."""
@@ -101,6 +118,158 @@ def month_bounds(month_str: str):
     except Exception:
         raise HTTPException(422, f"Invalid month format: {month_str}")
 
+# ===== BUSINESS RULES =====
+def calc_late(punch_in: datetime, shift_start_dt: datetime) -> int:
+    """R2: late only if strictly > 600s after shift_start, then floor(s/60)."""
+    secs = (punch_in - shift_start_dt).total_seconds()
+    return int(secs // 60) if secs > 600 else 0
+
+def calc_overtime(punch_out: datetime, shift_end_dt: datetime) -> int:
+    """R3: floor minutes after shift_end, only if >= 30."""
+    mins = int((punch_out - shift_end_dt).total_seconds() // 60)
+    return mins if mins >= 30 else 0
+
+def round_half_up(value, places: int = 2) -> float:
+    """Round half-up. Never use Python round() for reported numbers."""
+    q = Decimal(10) ** -places
+    return float(Decimal(str(value)).quantize(q, rounding=ROUND_HALF_UP))
+
+def calc_work_hours(punch_in: datetime, punch_out: datetime) -> float:
+    """R4: Decimal(seconds) / Decimal(3600), half-up to 2 decimals."""
+    secs = int((punch_out - punch_in).total_seconds())
+    return round_half_up(Decimal(secs) / Decimal(3600), 2)
+
+def is_half_day(work_hours: float) -> bool:
+    """R5: true when rounded work_hours < 4.50."""
+    return work_hours < 4.50
+
+# ===== MODELS =====
+class EmployeeIn(BaseModel):
+    """Employee creation payload."""
+    emp_code: str = Field(pattern=r"^EMP\d{4,6}$")
+    name: str = Field(min_length=1, max_length=100)
+    email: str = Field(max_length=120, pattern=r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+    department: str = Field(min_length=1, max_length=50)
+    shift_start: str = Field(default="09:30", pattern=r"^([01]\d|2[0-3]):[0-5]\d$")
+    shift_end: str = Field(default="18:30", pattern=r"^([01]\d|2[0-3]):[0-5]\d$")
+    joined_on: str
+
+    @field_validator("joined_on")
+    @classmethod
+    def check_date(cls, v):
+        if not isinstance(v, str) or not DATE_RE.match(v):
+            raise ValueError("must be YYYY-MM-DD")
+        try:
+            date_type.fromisoformat(v)
+        except (ValueError, TypeError):
+            raise ValueError("must be YYYY-MM-DD")
+        return v
+
+    @model_validator(mode="after")
+    def shifts_differ(self):
+        if self.shift_start == self.shift_end:
+            raise ValueError("shift_start and shift_end must differ")
+        return self
+
+
+class PunchInIn(BaseModel):
+    """Punch-in request payload."""
+    emp_code: str
+    punched_at: Optional[EpochMs] = None
+    status: str = "PRESENT"
+
+    @field_validator("status")
+    @classmethod
+    def check_status(cls, v):
+        if v not in PRESENT_STATUSES:
+            raise ValueError("must be PRESENT, WFH or ON_DUTY")
+        return v
+
+
+class PunchOutIn(BaseModel):
+    """Punch-out request payload."""
+    emp_code: str
+    punched_at: Optional[EpochMs] = None
+
+
+class RegularizeIn(BaseModel):
+    """Attendance regularization request payload."""
+    status: Optional[str] = None
+    punch_in: Optional[EpochMs] = None
+    punch_out: Optional[EpochMs] = None
+    reason: str = Field(min_length=5, max_length=200)
+    regularized_by: str = Field(min_length=1, max_length=50)
+
+    @field_validator("status")
+    @classmethod
+    def check_status(cls, v):
+        if v is not None and v not in ALL_STATUSES:
+            raise ValueError("must be PRESENT, WFH, ON_DUTY, ABSENT or LEAVE")
+        return v
+
+# ===== SERIALIZERS =====
+def serialize_emp(doc: dict) -> dict:
+    """Serialize an employee Mongo document into an API response dict."""
+    return {
+        "emp_code": doc["emp_code"],
+        "name": doc["name"],
+        "email": doc["email"],
+        "department": doc["department"],
+        "shift_start": doc["shift_start"],
+        "shift_end": doc["shift_end"],
+        "joined_on": doc["joined_on"],
+        "created_at": dt_to_ms(doc["created_at"]),
+    }
+
+def serialize_att(doc: dict) -> dict:
+    """Serialize an attendance log Mongo document into an API response dict."""
+    pi, po = doc.get("punch_in"), doc.get("punch_out")
+    return {
+        "emp_code": doc["emp_code"],
+        "date": doc["date"],
+        "status": doc["status"],
+        "punch_in": dt_to_ms(pi) if pi else None,
+        "punch_out": dt_to_ms(po) if po else None,
+        "work_hours": doc.get("work_hours"),
+        "late_minutes": doc.get("late_minutes", 0),
+        "overtime_minutes": doc.get("overtime_minutes", 0),
+        "half_day": doc.get("half_day", False),
+        "history": [_ser_hist(h) for h in doc.get("history", [])],
+    }
+
+def _ser_hist(h: dict) -> dict:
+    """Serialize a single history audit entry converting datetimes to epoch ms."""
+    changes = {}
+    for fld, ch in h["changes"].items():
+        f, t = ch["from"], ch["to"]
+        if fld in ("punch_in", "punch_out"):
+            f = dt_to_ms(f) if f else None
+            t = dt_to_ms(t) if t else None
+        changes[fld] = {"from": f, "to": t}
+    return {"at": dt_to_ms(h["at"]), "by": h["by"],
+            "reason": h["reason"], "changes": changes}
+
+# ===== INDEXES AND APP LIFESPAN =====
+@asynccontextmanager
+async def lifespan(app_instance):
+    """Create indexes at startup on employees and attendance_logs."""
+    # employees indexes
+    db.employees.create_index("emp_code", unique=True)
+    db.employees.create_index([("department", ASCENDING), ("emp_code", ASCENDING)])
+    db.employees.create_index("joined_on")
+    # attendance_logs indexes
+    db.attendance_logs.create_index(
+        [("emp_code", ASCENDING), ("date", ASCENDING)], unique=True)
+    db.attendance_logs.create_index(
+        [("date", DESCENDING), ("emp_code", ASCENDING)])
+    db.attendance_logs.create_index(
+        [("emp_code", ASCENDING), ("punch_in", DESCENDING)])
+    yield
+
+app = FastAPI(
+    title="Employee Attendance & Analytics API", version="2.0.0", lifespan=lifespan)
+
+# ===== QUERY BUILDERS =====
 def build_attendance_list(
     emp_code: Optional[str] = None,
     date_from: Optional[str] = None,
@@ -109,6 +278,7 @@ def build_attendance_list(
     page: int = 1,
     page_size: int = 20,
 ):
+    """Build filter, sort, and pagination parameters for listing attendance logs."""
     filt: dict = {}
     if emp_code:
         filt["emp_code"] = emp_code
@@ -132,6 +302,9 @@ def build_attendance_list(
     return "attendance_logs", filt, sort, skip, page_size
 
 def build_employee_monthly(emp_code: str, month: str):
+    """Build aggregation pipeline for one employee's monthly attendance summary.
+    Matches employee logs in month, counts Mon-Fri units (0.5 for half day), and sums late/OT.
+    """
     first_day, last_day, _, _ = month_bounds(month)
     pipeline = [
         {"$match": {"emp_code": emp_code, "date": {"$gte": first_day, "$lte": last_day}}},
@@ -156,6 +329,10 @@ def build_employee_monthly(emp_code: str, month: str):
     return "attendance_logs", pipeline
 
 def build_department_summary(month: str, department: Optional[str] = None):
+    """Build aggregation pipeline for department monthly summary.
+    Starts from employees so employees with zero logs still count in headcount.
+    Looks up matching attendance logs in the month and aggregates totals.
+    """
     first_day, last_day, _, _ = month_bounds(month)
     match_cond: dict = {"joined_on": {"$lte": last_day}}
     if department:
@@ -209,6 +386,7 @@ def build_department_summary(month: str, department: Optional[str] = None):
             }},
         }},
         {"$addFields": {
+            # $round is used only to convert float work_hours into whole integer cents to avoid floating-point errors.
             "wh_cents": {"$sum": {"$map": {
                 "input": "$wh_logs", "as": "l",
                 "in": {"$round": [{"$multiply": ["$$l.work_hours", 100]}, 0]}
@@ -231,6 +409,9 @@ def build_department_summary(month: str, department: Optional[str] = None):
     return "employees", pipeline, hint
 
 def build_late_leaderboard(month: str, limit: int = 10, department: Optional[str] = None):
+    """Build aggregation pipeline for late leaderboard.
+    Groups late minutes by employee, joins employee names, and computes ranks with ties using $rank.
+    """
     first_day, last_day, _, _ = month_bounds(month)
     pipeline = [
         {"$match": {"date": {"$gte": first_day, "$lte": last_day}}},
@@ -246,6 +427,7 @@ def build_late_leaderboard(month: str, limit: int = 10, department: Optional[str
     if department:
         pipeline.append({"$match": {"emp.department": department}})
     pipeline.extend([
+        # $rank computes standard competition ranking where ties share a rank and subsequent ranks are skipped (1, 2, 2, 4).
         {"$setWindowFields": {
             "sortBy": {"total_late_minutes": -1},
             "output": {"rank": {"$rank": {}}},
@@ -260,6 +442,7 @@ def build_late_leaderboard(month: str, limit: int = 10, department: Optional[str
     return "attendance_logs", pipeline
 
 def load_trend_inputs(department: str, from_str: str, to_str: str):
+    """Validate query dates, range, and department existence; return emp_codes and joined_on dates."""
     d_from = parse_date(from_str)
     d_to = parse_date(to_str)
     if d_to < d_from:
@@ -276,6 +459,9 @@ def load_trend_inputs(department: str, from_str: str, to_str: str):
     return emp_codes, joined
 
 def build_department_trend(emp_codes: list, joined: list, from_str: str, to_str: str):
+    """Build aggregation pipeline for daily department trend with gap-filling and moving average.
+    Matches logs, unions a seed row so $densify always has input, densifies all days, and windows moving average.
+    """
     d_from = parse_date(from_str)
     d_to = parse_date(to_str)
     from_dt = datetime(d_from.year, d_from.month, d_from.day, tzinfo=timezone.utc)
@@ -297,6 +483,7 @@ def build_department_trend(emp_codes: list, joined: list, from_str: str, to_str:
             "late_count": {"$sum": {"$cond": [{"$gt": [{"$ifNull": ["$late_minutes", 0]}, 0]}, 1, 0]}},
         }},
         {"$addFields": {"day": {"$dateFromString": {"dateString": "$_id"}}}},
+        # Add a dummy seed document before from_date so $densify always has an input stream even with zero logs.
         {"$unionWith": {
             "coll": "employees",
             "pipeline": [
@@ -304,7 +491,9 @@ def build_department_trend(emp_codes: list, joined: list, from_str: str, to_str:
                 {"$project": {"_id": 0, "day": seed_dt}},
             ],
         }},
+        # $densify generates every missing calendar date within the query range.
         {"$densify": {"field": "day", "range": {"step": 1, "unit": "day", "bounds": [from_dt, densify_end]}}},
+        # Remove the seed document after densification.
         {"$match": {"day": {"$gte": from_dt}}},
         {"$addFields": {
             "date": {"$dateToString": {"format": "%Y-%m-%d", "date": "$day"}},
@@ -318,6 +507,7 @@ def build_department_trend(emp_codes: list, joined: list, from_str: str, to_str:
             }}}
         }},
         {"$addFields": {
+            # Exact half-up rounding using integer arithmetic: floor((10000 * ph + headcount) / (2 * headcount)).
             "rate_ticks": {
                 "$cond": [
                     {"$and": ["$is_working", {"$gt": ["$headcount", 0]}]},
@@ -344,167 +534,23 @@ def build_department_trend(emp_codes: list, joined: list, from_str: str, to_str:
     ]
     return "attendance_logs", pipeline
 
-# ---- business rule helpers ------------------------------------------------ #
-def calc_late(punch_in: datetime, shift_start_dt: datetime) -> int:
-    """R2: late only if strictly > 600s after shift_start, then floor(s/60)."""
-    secs = (punch_in - shift_start_dt).total_seconds()
-    return int(secs // 60) if secs > 600 else 0
-
-def calc_overtime(punch_out: datetime, shift_end_dt: datetime) -> int:
-    """R3: floor minutes after shift_end, only if >= 30."""
-    mins = int((punch_out - shift_end_dt).total_seconds() // 60)
-    return mins if mins >= 30 else 0
-
-def round_half_up(value, places: int = 2) -> float:
-    """Round half-up. Never use Python round() for reported numbers."""
-    q = Decimal(10) ** -places
-    return float(Decimal(str(value)).quantize(q, rounding=ROUND_HALF_UP))
-
-
-def calc_work_hours(punch_in: datetime, punch_out: datetime) -> float:
-    """R4: Decimal(seconds) / Decimal(3600), half-up to 2 decimals."""
-    secs = int((punch_out - punch_in).total_seconds())
-    return round_half_up(Decimal(secs) / Decimal(3600), 2)
-
-def is_half_day(work_hours: float) -> bool:
-    """R5: true when rounded work_hours < 4.50."""
-    return work_hours < 4.50
-
-# ---- Pydantic models ----------------------------------------------------- #
-class EmployeeIn(BaseModel):
-    emp_code: str = Field(pattern=r"^EMP\d{4,6}$")
-    name: str = Field(min_length=1, max_length=100)
-    email: str = Field(max_length=120, pattern=r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
-    department: str = Field(min_length=1, max_length=50)
-    shift_start: str = Field(default="09:30", pattern=r"^([01]\d|2[0-3]):[0-5]\d$")
-    shift_end: str = Field(default="18:30", pattern=r"^([01]\d|2[0-3]):[0-5]\d$")
-    joined_on: str
-
-    @field_validator("joined_on")
-    @classmethod
-    def check_date(cls, v):
-        if not isinstance(v, str) or not DATE_RE.match(v):
-            raise ValueError("must be YYYY-MM-DD")
-        try:
-            date_type.fromisoformat(v)
-        except (ValueError, TypeError):
-            raise ValueError("must be YYYY-MM-DD")
-        return v
-
-    @model_validator(mode="after")
-    def shifts_differ(self):
-        if self.shift_start == self.shift_end:
-            raise ValueError("shift_start and shift_end must differ")
-        return self
-
-
-class PunchInIn(BaseModel):
-    emp_code: str
-    punched_at: Optional[EpochMs] = None
-    status: str = "PRESENT"
-
-    @field_validator("status")
-    @classmethod
-    def check_status(cls, v):
-        if v not in PRESENT_STATUSES:
-            raise ValueError(f"must be PRESENT, WFH or ON_DUTY")
-        return v
-
-
-class PunchOutIn(BaseModel):
-    emp_code: str
-    punched_at: Optional[EpochMs] = None
-
-
-class RegularizeIn(BaseModel):
-    status: Optional[str] = None
-    punch_in: Optional[EpochMs] = None
-    punch_out: Optional[EpochMs] = None
-    reason: str = Field(min_length=5, max_length=200)
-    regularized_by: str = Field(min_length=1, max_length=50)
-
-    @field_validator("status")
-    @classmethod
-    def check_status(cls, v):
-        if v is not None and v not in ALL_STATUSES:
-            raise ValueError(f"must be PRESENT, WFH, ON_DUTY, ABSENT or LEAVE")
-        return v
-
-# ---- serializers (Mongo doc -> API JSON) ---------------------------------- #
-def serialize_emp(doc: dict) -> dict:
-    return {
-        "emp_code": doc["emp_code"],
-        "name": doc["name"],
-        "email": doc["email"],
-        "department": doc["department"],
-        "shift_start": doc["shift_start"],
-        "shift_end": doc["shift_end"],
-        "joined_on": doc["joined_on"],
-        "created_at": dt_to_ms(doc["created_at"]),
-    }
-
-def serialize_att(doc: dict) -> dict:
-    pi, po = doc.get("punch_in"), doc.get("punch_out")
-    return {
-        "emp_code": doc["emp_code"],
-        "date": doc["date"],
-        "status": doc["status"],
-        "punch_in": dt_to_ms(pi) if pi else None,
-        "punch_out": dt_to_ms(po) if po else None,
-        "work_hours": doc.get("work_hours"),
-        "late_minutes": doc.get("late_minutes", 0),
-        "overtime_minutes": doc.get("overtime_minutes", 0),
-        "half_day": doc.get("half_day", False),
-        "history": [_ser_hist(h) for h in doc.get("history", [])],
-    }
-
-def _ser_hist(h: dict) -> dict:
-    changes = {}
-    for fld, ch in h["changes"].items():
-        f, t = ch["from"], ch["to"]
-        if fld in ("punch_in", "punch_out"):
-            f = dt_to_ms(f) if f else None
-            t = dt_to_ms(t) if t else None
-        changes[fld] = {"from": f, "to": t}
-    return {"at": dt_to_ms(h["at"]), "by": h["by"],
-            "reason": h["reason"], "changes": changes}
-
-# ---- index setup (lifespan) ---------------------------------------------- #
-@asynccontextmanager
-async def lifespan(app_instance):
-    # employees indexes
-    db.employees.create_index("emp_code", unique=True)
-    db.employees.create_index([("department", ASCENDING), ("emp_code", ASCENDING)])
-    db.employees.create_index("joined_on")
-    # attendance_logs indexes
-    db.attendance_logs.create_index(
-        [("emp_code", ASCENDING), ("date", ASCENDING)], unique=True)
-    db.attendance_logs.create_index(
-        [("date", DESCENDING), ("emp_code", ASCENDING)])
-    db.attendance_logs.create_index(
-        [("emp_code", ASCENDING), ("punch_in", DESCENDING)])
-    yield
-
-app = FastAPI(
-    title="Employee Attendance & Analytics API", version="2.0.0", lifespan=lifespan)
-
-# ---- endpoints ----------------------------------------------------------- #
-
-# -- health --
+# ===== CRUD ENDPOINTS =====
 @app.get("/health")
 def health():
+    """Health check endpoint to ping MongoDB."""
     try:
         client.admin.command("ping")
     except Exception:
         raise HTTPException(503, "MongoDB unavailable")
     return {"status": "ok"}
 
-# -- employees --
 @app.post("/employees", status_code=201)
 def create_employee(body: EmployeeIn):
+    """Create a new employee record."""
     doc = body.model_dump()
     doc["created_at"] = now_dt()
     try:
+        # The unique emp_code index prevents duplicate creates; DuplicateKeyError returns 409 Conflict.
         db.employees.insert_one(doc)
     except DuplicateKeyError:
         raise HTTPException(409, f"Employee {body.emp_code} already exists")
@@ -516,6 +562,7 @@ def list_employees(
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=100),
 ):
+    """List employees filtered by department with pagination."""
     filt: dict = {}
     if department is not None:
         filt["department"] = department
@@ -525,9 +572,9 @@ def list_employees(
     return {"items": [serialize_emp(d) for d in docs],
             "total": total, "page": page, "page_size": page_size}
 
-# -- punch-in --
 @app.post("/attendance/punch-in", status_code=201)
 def punch_in(body: PunchInIn):
+    """Record an employee punch-in event."""
     emp = db.employees.find_one({"emp_code": body.emp_code})
     if not emp:
         raise HTTPException(404, f"Employee {body.emp_code} not found")
@@ -551,14 +598,15 @@ def punch_in(body: PunchInIn):
         "history": [],
     }
     try:
+        # The unique (emp_code, date) index prevents double punch-ins; DuplicateKeyError returns 409 Conflict.
         db.attendance_logs.insert_one(doc)
     except DuplicateKeyError:
         raise HTTPException(409, f"Already punched in for {date_str}")
     return serialize_att(doc)
 
-# -- punch-out --
 @app.post("/attendance/punch-out")
 def punch_out(body: PunchOutIn):
+    """Record an employee punch-out event and compute work hours."""
     emp = db.employees.find_one({"emp_code": body.emp_code})
     if not emp:
         raise HTTPException(404, f"Employee {body.emp_code} not found")
@@ -606,7 +654,6 @@ def punch_out(body: PunchOutIn):
     updated = db.attendance_logs.find_one({"_id": rec["_id"]})
     return serialize_att(updated)
 
-# -- list attendance --
 @app.get("/attendance")
 def list_attendance(
     emp_code: Optional[str] = None,
@@ -616,6 +663,7 @@ def list_attendance(
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=100),
 ):
+    """List attendance logs filtered by employee, date range, or status."""
     _, filt, sort, skip, limit = build_attendance_list(
         emp_code=emp_code,
         date_from=date_from,
@@ -629,9 +677,9 @@ def list_attendance(
     return {"items": [serialize_att(d) for d in docs],
             "total": total, "page": page, "page_size": page_size}
 
-# -- regularize (PATCH) --
 @app.patch("/attendance/{emp_code}/{date}")
 def regularize_attendance(emp_code: str, date: str, body: RegularizeIn):
+    """Regularize an attendance record with manual corrections and audit trail."""
     parse_date(date)
     emp = db.employees.find_one({"emp_code": emp_code})
     if not emp:
@@ -711,6 +759,7 @@ def regularize_attendance(emp_code: str, date: str, body: RegularizeIn):
         "changes": changes,
     }
 
+    # Guard matches history array length to ensure concurrent patches do not overwrite each other.
     guard = {"history": {"$size": len(rec["history"])}} if "history" in rec else {"history": {"$exists": False}}
     res = db.attendance_logs.update_one(
         {"_id": rec["_id"], **guard},
@@ -722,14 +771,13 @@ def regularize_attendance(emp_code: str, date: str, body: RegularizeIn):
     updated = db.attendance_logs.find_one({"_id": rec["_id"]})
     return serialize_att(updated)
 
-# ---- analytics endpoints ------------------------------------------------- #
-
-# 6a. employee monthly
+# ===== ANALYTICS ENDPOINTS =====
 @app.get("/analytics/employees/{emp_code}/monthly")
 def get_employee_monthly(
     emp_code: str,
     month: str = Query(..., pattern=r"^\d{4}-(0[1-9]|1[0-2])$"),
 ):
+    """Compute monthly attendance metrics for a single employee."""
     emp = db.employees.find_one({"emp_code": emp_code})
     if not emp:
         raise HTTPException(404, f"Employee {emp_code} not found")
@@ -771,12 +819,12 @@ def get_employee_monthly(
         "attendance_pct": att_pct,
     }
 
-# 6b. department summary
 @app.get("/analytics/departments/summary")
 def get_department_summary(
     month: str = Query(..., pattern=r"^\d{4}-(0[1-9]|1[0-2])$"),
     department: Optional[str] = None,
 ):
+    """Compute aggregated monthly attendance metrics for departments."""
     coll, pipeline, hint = build_department_summary(month, department)
     docs = list(db[coll].aggregate(pipeline, hint=hint))
 
@@ -796,24 +844,24 @@ def get_department_summary(
         })
     return {"month": month, "items": items}
 
-# 6c. late leaderboard
 @app.get("/analytics/leaderboard/late")
 def get_late_leaderboard(
     month: str = Query(..., pattern=r"^\d{4}-(0[1-9]|1[0-2])$"),
     limit: int = Query(10, ge=1, le=50),
     department: Optional[str] = None,
 ):
+    """Rank employees by total late minutes for a given month."""
     coll, pipeline = build_late_leaderboard(month, limit, department)
     items = list(db[coll].aggregate(pipeline))
     return {"month": month, "items": items}
 
-# 6d. department trend
 @app.get("/analytics/departments/{department}/trend")
 def get_department_trend(
     department: str,
     from_date: str = Query(..., alias="from"),
     to_date: str = Query(..., alias="to"),
 ):
+    """Compute daily attendance trend and 7-day moving averages for a department."""
     emp_codes, joined = load_trend_inputs(department, from_date, to_date)
     coll, pipeline = build_department_trend(emp_codes, joined, from_date, to_date)
     docs = list(db[coll].aggregate(pipeline))
@@ -842,7 +890,7 @@ def get_department_trend(
         })
     return {"department": department, "items": items}
 
-# ---- explain endpoint (Step 7) ------------------------------------------- #
+# ===== EXPLAIN ENDPOINT =====
 @app.get("/admin/explain/{endpoint}")
 def explain_endpoint(
     endpoint: Literal[
@@ -864,6 +912,7 @@ def explain_endpoint(
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=100),
 ):
+    """Run MongoDB executionStats explain on an endpoint's main query."""
     if endpoint == "attendance_list":
         coll, filt, sort, skip, limit_val = build_attendance_list(
             emp_code=emp_code, date_from=date_from, date_to=date_to,

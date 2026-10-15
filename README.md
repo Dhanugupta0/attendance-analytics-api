@@ -1,56 +1,55 @@
 # Employee Attendance & Analytics API
 
-Production-ready Employee Attendance & Analytics API built with FastAPI, PyMongo, and MongoDB 7.
+This is a small employee attendance and analytics service built with FastAPI and MongoDB.
+
+## Requirements
+
+- Python 3.11+
+- MongoDB 6.0+ (tested on MongoDB 7.0)
 
 ## How to Run
 
-1. **Virtual environment and dependencies:**
+1. Create and activate a virtual environment:
    ```bash
    python -m venv .venv
    source .venv/bin/activate
    pip install -r requirements.txt
    ```
-
-2. **Environment configuration:**
-   Set environment variables (or define in a local `.env` file):
+2. Set configuration in environment variables or in a local `.env` file (real environment variables win):
    ```bash
    export MONGO_URI="mongodb://localhost:27017"
    export MONGO_DB="attendance_db"
    ```
-
-3. **Seed sample data (optional):**
-   ```bash
-   python sample_seed.py
-   ```
-
-4. **Start the API server:**
+3. Start the application:
    ```bash
    uvicorn app.main:app --port 8000
    ```
+Database indexes are created automatically at startup. The `/health` endpoint returns `{"status": "ok"}` with status 200 when MongoDB answers.
 
-Indexes are created automatically at application startup during the lifespan context.
+## Endpoints
 
----
+- `GET /health`: Readiness probe that checks MongoDB connection.
+- `POST /employees`: Create an employee record with a unique `emp_code`.
+- `GET /employees`: List employees filtered by department with pagination.
+- `POST /attendance/punch-in`: Record a daily punch-in with grace and late checks.
+- `POST /attendance/punch-out`: Record punch-out and compute work hours, overtime, and half day.
+- `GET /attendance`: List attendance logs with filter and pagination.
+- `PATCH /attendance/{emp_code}/{date}`: Regularize a log and append an audit entry.
+- `GET /analytics/employees/{emp_code}/monthly`: Monthly summary of attendance for one employee.
+- `GET /analytics/departments/summary`: Department monthly metrics including zero-log headcount.
+- `GET /analytics/leaderboard/late`: Late employee leaderboard with competition ranking.
+- `GET /analytics/departments/{department}/trend`: Daily attendance trend with 7-day moving average.
+- `GET /admin/explain/{endpoint}`: MongoDB executionStats explain output for query plans.
 
-## Assumptions & Design Details
+## Assumptions
 
-1. **Error Check Order:**
-   Where API specification edge cases were ambiguous, the endpoint validation order consistently checks:
-   - `404 Not Found` (missing employee, missing attendance record), then
-   - `409 Conflict` (duplicate entries, already punched in/out, concurrent race updates), then
-   - `422 Unprocessable Content` (invalid inputs, timestamps out of range, logic contradictions).
+1. Where the contract is unclear, I check 404 first, then 409, and then 422.
+2. For the trend endpoint, an invalid date range returns 422 before an unknown department returns 404.
+3. The 7-day moving average uses the rounded (4 decimals, half-up) daily rates shown in the response, then rounds the mean half-up to 4 decimals. Days with a null rate stay inside the 7-row window, but I skip them when computing the mean.
+4. The trend pipeline inserts one seed document dated one day before the query start date so that `$densify` always has an input document, and removes it with `$match` afterwards.
+5. The department summary pipeline passes an explicit index hint so MongoDB uses an index scan on employees instead of a collection scan.
+6. All reported numbers use exact arithmetic half-up rounding (Decimal or integer math), never built-in Python `round()` or Mongo `$round` on reported values. The only place `$round` is used is converting `work_hours * 100` to integer cents.
 
-2. **Department Trend Validation Order:**
-   For `GET /analytics/departments/{department}/trend`, bad date ranges (invalid date, `to < from`, or `range > 92 days`) return `422` before querying the database, which returns `404` if the department does not exist.
+## What is Missing
 
-3. **7-Day Trend Moving Average:**
-   The moving average window uses the current calendar day plus up to 6 preceding calendar days in the window. Days where the daily rate is `null` (e.g. non-working weekends or zero headcount) stay within the 7-day window, but are excluded from the average calculation. The moving average uses the rounded (4-decimal, half-up) daily rates that appear in the response, then rounds the mean half-up to 4 decimals.
-
-4. **Seed Document in Trend Pipeline:**
-   The trend aggregation pipeline uses MongoDB's `$densify` operator to guarantee a continuous date sequence across all days in `from..to`. In MongoDB, `$densify` requires at least one document in its input stream; if a department has zero attendance logs in the entire query window, `$densify` would otherwise produce zero output documents. To ensure exact completeness, a single seed document dated `from_dt - 1 day` is prepended via `$unionWith` (using an index-covered `$match` on employee), densification runs across the full range, and the seed row is filtered out with `$match: {day: {$gte: from_dt}}`.
-
-5. **Index Hint in Department Summary:**
-   The `/analytics/departments/summary` pipeline starts from the `employees` collection to ensure employees with zero attendance records are included in the department headcount. An index hint (`{"joined_on": 1}` when no department filter is specified, or `{"department": 1, "emp_code": 1}` when filtered by department) is passed directly to the aggregation query and explain builder to guarantee index usage (`IXSCAN`) and eliminate any `COLLSCAN`.
-
-6. **Completeness:**
-   Nothing is missing. All business rules R1–R10, endpoints, validation constraints, indexes, serializers, and explain capabilities are fully implemented in `app/main.py`.
+Nothing is missing.
